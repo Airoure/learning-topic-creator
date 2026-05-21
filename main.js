@@ -2,6 +2,7 @@ const { Modal, Notice, Plugin, Setting, normalizePath } = require("obsidian");
 
 const OVERVIEW_TEMPLATE_PATH = "模板/主题地图模板.md";
 const QUESTION_TEMPLATE_PATH = "模板/问题驱动费曼笔记模板.md";
+const CLIPPING_TEMPLATE_PATH = "模板/资源吸收笔记模板.md";
 
 module.exports = class LearningTopicCreatorPlugin extends Plugin {
   async onload() {
@@ -22,6 +23,17 @@ module.exports = class LearningTopicCreatorPlugin extends Plugin {
       name: "新建问题驱动笔记",
       callback: () => {
         new QuestionNoteModal(this.app).open();
+      },
+    });
+
+    this.addCommand({
+      id: "create-resource-note-from-selection",
+      name: "从剪藏文字新建资源吸收笔记",
+      editorCallback: (editor, view) => {
+        const selectedText = editor.getSelection();
+        const clippingText = selectedText.trim() || editor.getValue().trim();
+        const sourcePath = view?.file?.path ?? "";
+        new ResourceNoteModal(this.app, clippingText, sourcePath).open();
       },
     });
   }
@@ -191,6 +203,122 @@ class QuestionNoteModal extends Modal {
   }
 }
 
+class ResourceNoteModal extends Modal {
+  constructor(app, clippingText, sourcePath) {
+    super(app);
+    this.category = "";
+    this.topic = "";
+    this.title = "";
+    this.relatedQuestion = "";
+    this.sourceUrl = "";
+    this.clippingText = clippingText;
+    this.sourcePath = sourcePath;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("learning-topic-modal");
+
+    contentEl.createEl("h2", { text: "从剪藏文字新建资源吸收笔记" });
+    contentEl.createEl("p", {
+      text: this.clippingText
+        ? "把选中文字或当前文件内容转成可吸收的资源笔记。"
+        : "没有读取到文字，请先选中剪藏内容，或在剪藏文件中执行命令。",
+    });
+
+    addTextSetting(contentEl, "分类", "例如: 网络、Android、Agent", "网络", (value) => {
+      this.category = value;
+    }, (event) => this.submitOnEnter(event));
+
+    addTextSetting(contentEl, "主题", "例如: HTTP、TCP、Handler", "HTTP", (value) => {
+      this.topic = value;
+    }, (event) => this.submitOnEnter(event));
+
+    addTextSetting(contentEl, "标题", "资源吸收笔记标题", "HTTP 缓存文章吸收", (value) => {
+      this.title = value;
+    }, (event) => this.submitOnEnter(event), true);
+
+    addTextSetting(contentEl, "关联问题", "这段内容可能回答哪个问题", "为什么浏览器拿到旧数据？", (value) => {
+      this.relatedQuestion = value;
+    }, (event) => this.submitOnEnter(event));
+
+    addTextSetting(contentEl, "来源链接", "可选，原文 URL", "https://", (value) => {
+      this.sourceUrl = value;
+    }, (event) => this.submitOnEnter(event));
+
+    new Setting(contentEl)
+      .addButton((button) => {
+        button
+          .setButtonText("创建")
+          .setCta()
+          .onClick(() => this.createResourceNote());
+      })
+      .addButton((button) => {
+        button
+          .setButtonText("取消")
+          .onClick(() => this.close());
+      });
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+
+  submitOnEnter(event) {
+    if (event.key === "Enter" && event.ctrlKey) {
+      event.preventDefault();
+      this.createResourceNote();
+    }
+  }
+
+  async createResourceNote() {
+    const category = sanitizePathPart(this.category);
+    const topic = sanitizePathPart(this.topic);
+    const title = this.title.trim();
+    const fileName = sanitizePathPart(title);
+    const clippingText = this.clippingText.trim();
+
+    if (!category || !topic || !title || !fileName) {
+      new Notice("请填写分类、主题和标题");
+      return;
+    }
+
+    if (!clippingText) {
+      new Notice("没有可吸收的剪藏文字");
+      return;
+    }
+
+    try {
+      const paths = await createTopicPackage(this.app, category, topic);
+      const resourcePath = normalizePath(`${paths.topicRoot}/资源/${fileName}.md`);
+
+      if (!(await this.app.vault.adapter.exists(resourcePath))) {
+        const content = await buildResourceContent(this.app, {
+          topic,
+          title,
+          clipping: clippingText,
+          relatedQuestion: this.relatedQuestion.trim(),
+          sourceUrl: this.sourceUrl.trim(),
+          sourcePath: this.sourcePath,
+        });
+        await this.app.vault.create(resourcePath, content);
+      }
+
+      const file = this.app.vault.getAbstractFileByPath(resourcePath);
+      if (file) {
+        await this.app.workspace.getLeaf(false).openFile(file);
+      }
+
+      new Notice(`已创建资源吸收笔记: ${title}`);
+      this.close();
+    } catch (error) {
+      console.error(error);
+      new Notice(`创建失败: ${error.message ?? error}`);
+    }
+  }
+}
+
 function addTextSetting(contentEl, name, desc, placeholder, onChange, onEnter, focus = false) {
   new Setting(contentEl)
     .setName(name)
@@ -256,6 +384,11 @@ async function buildQuestionContent(app, topic, question) {
   });
 }
 
+async function buildResourceContent(app, values) {
+  const content = await readTemplate(app, CLIPPING_TEMPLATE_PATH, fallbackResourceTemplate());
+  return hydrateTemplate(content, values);
+}
+
 async function readTemplate(app, path, fallback) {
   if (await app.vault.adapter.exists(path)) {
     return app.vault.adapter.read(path);
@@ -269,9 +402,14 @@ function hydrateTemplate(content, values) {
     .replaceAll("{{title}}", values.title)
     .replaceAll("{{topic}}", values.topic)
     .replaceAll("{{question}}", values.question ?? "")
+    .replaceAll("{{clipping}}", values.clipping ?? "")
+    .replaceAll("{{relatedQuestion}}", values.relatedQuestion ?? "")
+    .replaceAll("{{sourceUrl}}", values.sourceUrl ?? "")
+    .replaceAll("{{sourcePath}}", values.sourcePath ?? "")
     .replaceAll("{{date:YYYY-MM-DD}}", today)
     .replace(/^主题:\s*$/m, `主题: ${values.topic}`)
     .replace(/^问题:\s*$/m, values.question ? `问题: ${values.question}` : "问题:")
+    .replace(/^来源:\s*$/m, values.sourceUrl ? `来源: ${values.sourceUrl}` : "来源:")
     .replace(/^# .*/m, `# ${values.title}`);
 }
 
@@ -377,6 +515,73 @@ tags:
 - 后续问题:
 
 ## 最终答案
+
+`;
+}
+
+function fallbackResourceTemplate() {
+  return `---
+类型: 资源吸收
+主题: {{topic}}
+状态: 待读
+来源: {{sourceUrl}}
+创建日期: "{{date:YYYY-MM-DD}}"
+tags:
+  - resource
+  - clipping
+---
+
+# {{title}}
+
+## 原始摘录
+
+\`\`\`text
+{{clipping}}
+\`\`\`
+
+## 它可能回答的问题
+
+- {{relatedQuestion}}
+- 
+- 
+
+## 它提供的新解释
+
+
+## 它修正了我的什么理解
+
+
+## 可沉淀的原子笔记
+
+- 
+- 
+- 
+
+## 可转化的问题笔记
+
+- 
+- 
+- 
+
+## 可实践验证的动作
+
+- 
+- 
+- 
+
+## 分流结果
+
+- [ ] 已补充到主题地图:
+- [ ] 已创建或更新问题笔记:
+- [ ] 已创建或更新原子笔记:
+- [ ] 已创建或更新实践记录:
+
+## 来源
+
+- 原文链接: {{sourceUrl}}
+- 剪藏文件: {{sourcePath}}
+
+## 我的最终吸收
 
 `;
 }
